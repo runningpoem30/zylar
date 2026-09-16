@@ -12,6 +12,8 @@
     "postinstall": "prisma generate"
   },
   "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1133.0",
+    "@aws-sdk/lib-dynamodb": "^3.1133.0",
     "@prisma/client": "^6.2.0",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",

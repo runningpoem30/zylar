@@ -1,9 +1,65 @@
 import { PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3"
-import { s3Client } from "../lib/s3-utils.js"
+import { UpdateCommand } from "@aws-sdk/lib-dynamodb";
+import { s3Client, dynamoDb } from "../lib/s3-utils.js"
 import fs from "fs";
 import path from "path";
 import { Readable } from "stream";
 import { spawn, execSync } from "child_process";
+
+// ─── Configuration ───
+const JOB_STATUS_TABLE = process.env.JOB_STATUS_TABLE || "zylar-job-status";
+const CLOUDFRONT_URL = process.env.CLOUDFRONT_URL || "https://d3qk5a8a9f1q78.cloudfront.net";
+
+// ─── DynamoDB Status Updates ───
+async function updateJobStatus(
+    jobId: string,
+    status: string,
+    stage: string,
+    progress: number,
+    extra: Record<string, any> = {}
+) {
+    if (!jobId) return;
+
+    try {
+        const expressionParts = [
+            "#s = :status",
+            "stage = :stage",
+            "progress = :progress",
+            "updatedAt = :now"
+        ];
+        const attrValues: Record<string, any> = {
+            ":status": status,
+            ":stage": stage,
+            ":progress": progress,
+            ":now": new Date().toISOString()
+        };
+        const attrNames: Record<string, string> = { "#s": "status" };
+
+        // Add any extra fields (e.g., cloudfrontUrl, error)
+        for (const [key, value] of Object.entries(extra)) {
+            if (key === "error") {
+                expressionParts.push("#err = :error");
+                attrNames["#err"] = "error";
+                attrValues[":error"] = value;
+            } else {
+                expressionParts.push(`${key} = :${key}`);
+                attrValues[`:${key}`] = value;
+            }
+        }
+
+        await dynamoDb.send(new UpdateCommand({
+            TableName: JOB_STATUS_TABLE,
+            Key: { jobId },
+            UpdateExpression: `SET ${expressionParts.join(", ")}`,
+            ExpressionAttributeNames: attrNames,
+            ExpressionAttributeValues: attrValues
+        }));
+
+        console.log(`[Worker] Status → ${status} | ${stage} | ${progress}%`);
+    } catch (err) {
+        console.warn(`[Worker] Failed to update status for ${jobId}:`, err);
+    }
+}
 
 
 async function downloadFromS3(bucket: string, key: string, destination: string) {
@@ -15,7 +71,7 @@ async function downloadFromS3(bucket: string, key: string, destination: string) 
         const fileWriter = fs.createWriteStream(destination);
         stream.pipe(fileWriter);
         fileWriter.on('finish', resolve);
-        fileWriter.off('error', reject);
+        fileWriter.on('error', reject);
     })
 
 }
@@ -118,6 +174,7 @@ async function run() {
     const BUCKET = process.env.S3_BUCKET!;
     const KEY = process.env.S3_KEY!;
     const DEST_BUCKET = process.env.DEST_BUCKET!;
+    const JOB_ID = process.env.JOB_ID || "";
 
     const inputPath = '/tmp/input_video.mp4';
     const outputDir = '/tmp/output';
@@ -129,24 +186,42 @@ async function run() {
             fs.mkdirSync(`${outputDir}/v${i}`, { recursive: true });
         }
 
+        // ── Stage 1: Download ──
+        await updateJobStatus(JOB_ID, "PROCESSING", "Downloading video from S3", 10);
         console.log("Stage 1: Downloading...");
         await downloadFromS3(BUCKET, KEY, inputPath);
 
+        // ── Stage 2: Transcode ──
+        await updateJobStatus(JOB_ID, "PROCESSING", "Transcoding — FFmpeg encoding 5 variants", 30);
         console.log("Stage 2: Transcoding...");
         await transcodingRawS3Video(inputPath, outputDir);
 
-
+        // ── Stage 3: Upload ──
+        await updateJobStatus(JOB_ID, "PROCESSING", "Uploading HLS segments to S3", 75);
         console.log("Stage 3: Uploading to new bucket...");
 
         const folderName = path.parse(KEY).name;
         await uploadFolderToS3(outputDir, DEST_BUCKET, `processed/${folderName}`);
 
+        // ── Stage 4: Complete ──
+        const cloudfrontUrl = `${CLOUDFRONT_URL}/processed/${folderName}/master.m3u8`;
+        await updateJobStatus(JOB_ID, "COMPLETED", "Transcoding complete", 100, {
+            cloudfrontUrl
+        });
+
         console.log("SUCCESS: Video is now live!");
+        console.log(`CloudFront URL: ${cloudfrontUrl}`);
+
     } catch (err) {
         console.error("FAILED:", err);
+
+        // ── Update status to FAILED ──
+        await updateJobStatus(JOB_ID, "FAILED", "Transcoding failed", 0, {
+            error: String(err)
+        });
+
         process.exit(1);
     }
 }
 
 run();
-

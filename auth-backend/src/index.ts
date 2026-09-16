@@ -3,6 +3,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import authRoutes from './routes/auth.js';
 import videoRoutes from './routes/videos.js';
+import statusRoutes from './routes/status.js';
 
 dotenv.config();
 
@@ -41,6 +42,7 @@ app.use(express.json());
 // Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/videos', videoRoutes);
+app.use('/api/status', statusRoutes);
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
